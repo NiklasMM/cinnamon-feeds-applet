@@ -240,6 +240,10 @@ FeedApplet.prototype = {
     },
 
     init_settings: function(instance_id) {
+
+        
+        //~ global.logError(GLib.getenv("CINNAMON_SESSION"));
+        
         this.settings = new Settings.AppletSettings(this, UUID, this.instance_id);
 
         this.settings.bindProperty(Settings.BindingDirection.IN,
@@ -293,6 +297,15 @@ FeedApplet.prototype = {
         s.icon.icon_type = St.IconType.SYMBOLIC;
         this._applet_context_menu.addMenuItem(s);
 
+        p = new Applet.MenuItem(
+                _("Edit Feeds File"),
+                "emblem-system-symbolic",
+                Lang.bind(this, function() {
+                    Util.spawnCommandLine('gedit ' + this.list_file);
+                }));
+
+        this._applet_context_menu.addMenuItem(p);     
+
         var s = new Applet.MenuItem(
                 _("Reload Feeds File"),
                 "view-refresh-symbolic",
@@ -309,7 +322,7 @@ FeedApplet.prototype = {
                     Util.spawnCommandLine('cinnamon-settings applets ' + UUID);
                 }));
         s.icon.icon_type = St.IconType.SYMBOLIC;
-        this._applet_context_menu.addMenuItem(s);
+        this._applet_context_menu.addMenuItem(s);   
     },
 
     feed_list_file_changed: function() {
