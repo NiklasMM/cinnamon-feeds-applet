@@ -27,6 +27,7 @@ const TOOLTIP_WIDTH = 500.0;
 imports.searchPath.push( imports.ui.appletManager.appletMeta[UUID].path );
 
 const Applet = imports.ui.applet;
+const Cinnamon = imports.gi.Cinnamon;
 const FeedReader = imports.feedreader;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
@@ -126,11 +127,22 @@ function FeedDisplayMenuItem() {
 FeedDisplayMenuItem.prototype = {
     __proto__: PopupMenu.PopupSubMenuMenuItem.prototype,
 
-    _init: function (reader, owner, params) {
-        PopupMenu.PopupSubMenuMenuItem.prototype._init.call(this, reader.title);
+    _init: function (url, owner, params) {
+        PopupMenu.PopupSubMenuMenuItem.prototype._init.call(this, _("Loading feed"));
 
         this.owner = owner;
-        this.reader = reader;
+        this.max_items = params.max_items;
+        this.show_feed_image = params.show_feed_image;
+        this.show_read_items = params.show_read_items;
+
+        /* Create reader */
+        this.reader = new FeedReader.FeedReader(
+                url,
+                '~/.cinnamon/' + UUID + '/' + owner.instance_id,
+                {
+                    'onUpdate' : Lang.bind(this, this.update),
+                    'onError' : Lang.bind(this, this.error)
+                });
 
         /* Create initial layout for menu title We wrap the main titlebox in a
          * container in order to avoid excessive spacing caused by the
@@ -153,9 +165,45 @@ FeedDisplayMenuItem.prototype = {
         this.removeActor(this._triangle);
         this.addActor(this.statusbox);
         this.addActor(container);
-        this.addActor(this._triangle, {align: St.Align.END});
+        this.addActor(this._triangle, {align: St.Align.START});
+
+        this.menu.connect('open-state-changed', Lang.bind(this, this.on_open_state_changed));
 
         this.update();
+    },
+
+    _getPreferredWidth: function(actor, forHeight, alloc) {
+        PopupMenu.PopupSubMenuMenuItem.prototype._getPreferredWidth.call(this, actor, forHeight, alloc);
+
+        /* If the submenu's natural width is greater than the title's natural
+         * width, use it instead. This avoids lots of nasty menu resizing when
+         * we open/close submenus */
+        let [sub_min, sub_natural] = this.menu.actor.get_preferred_width(-1);
+        if (alloc.natural_size < sub_natural)
+            alloc.min_size = alloc.natural_size = sub_natural;
+    },
+
+    update_params: function(params) {
+        this.max_items = params.max_items;
+        this.show_feed_image = params.show_feed_image;
+        this.show_read_items = params.show_read_items;
+        this.update();
+    },
+
+    refresh: function() {
+        this.reader.get();
+    },
+
+    get_title: function() {
+        return this.reader.title;
+    },
+
+    get_unread_count: function() {
+        let count = 0;
+        for (i in this.reader.items)
+            count++;
+
+        return count;
     },
 
     /* Rebuild the feed title, status, items from the feed reader */
@@ -164,10 +212,11 @@ FeedDisplayMenuItem.prototype = {
         /* Clear existing actors */
         this.statusbox.destroy_all_children();
         this.mainbox.destroy_all_children();
+        this.menu.removeAll();
 
         /* Use feed image where available for title */
         if (this.reader.image.path != undefined &&
-                this.owner.show_feed_image == true) {
+                this.show_feed_image == true) {
             try {
                 let image = St.TextureCache.get_default().load_uri_async(
                         GLib.filename_to_uri(this.reader.image.path, null),
@@ -216,7 +265,7 @@ FeedDisplayMenuItem.prototype = {
         button.connect('clicked', Lang.bind(this, function(button, event) {
             this.owner.menu.close();
             this.reader.mark_all_items_read();
-            this.owner.build_menu();
+            this.update();
         }));
         let tooltip = new Tooltips.Tooltip(button, _("Mark all as read"));
         buttonbox.add(button);
@@ -224,19 +273,36 @@ FeedDisplayMenuItem.prototype = {
         this.mainbox.add(buttonbox);
 
         let menu_items = 0;
-        let unread_count = 0;
-        for (var i = 0; i < this.reader.items.length; i++) {
+        for (var i = 0; i < this.reader.items.length && menu_items < this.max_items; i++) {
+            if (this.reader.items[i].read && !this.show_read_items)
+                continue;
+
             let item = new FeedMenuItem(this.reader.items[i]);
             item.connect("activate", function(actor, event) {
                 actor.read_item();
             });
             this.menu.addMenuItem(item);
 
-            if (!this.reader.items[i].read)
-                unread_count++;
-
             menu_items++;
         }
+
+        this.owner.update();
+    },
+
+    error: function(reader, message, full_message) {
+        this.statusbox.destroy_all_children();
+        this.menu.removeAll();
+
+        this.menu.addMenuItem(new LabelMenuItem(
+                    message, full_message));
+    },
+
+    on_open_state_changed: function(menu, open) {
+        this.show = open;
+        if (open)
+            this.owner.toggle_submenus(this);
+        else
+            this.owner.toggle_submenus(null);
     },
 };
 
@@ -251,6 +317,7 @@ FeedApplet.prototype = {
         Applet.IconApplet.prototype._init.call(this, orientation, panel_height, instance_id);
 
         try {
+            this.feeds = new Array();
             this.path = metadata.path;
             this.icon_path = metadata.path + '/icons/';
             Gtk.IconTheme.get_default().append_search_path(this.icon_path);
@@ -261,6 +328,8 @@ FeedApplet.prototype = {
             this.menu = new Applet.AppletPopupMenu(this, orientation);
             this.menuManager.addMenu(this.menu);
 
+            this.feed_file_error = false;
+
         } catch (e) {
             global.logError(e);
         }
@@ -268,6 +337,7 @@ FeedApplet.prototype = {
         this.init_settings();
 
         this.build_context_menu();
+        this.update();
     },
 
     init_settings: function(instance_id) {
@@ -278,18 +348,30 @@ FeedApplet.prototype = {
                 null);
 
         this.settings.bindProperty(Settings.BindingDirection.IN,
+                "show_read_items", "show_read_items", this.update_params, null);
+        this.settings.bindProperty(Settings.BindingDirection.IN,
+                "max_items", "max_items", this.update_params, null);
+        this.settings.bindProperty(Settings.BindingDirection.IN,
+                "show_feed_image", "show_feed_image", this.update_params, null);
+
+        this.settings.bindProperty(Settings.BindingDirection.IN,
+                "use_list_file", "use_list_file", this.feed_source_changed, null);
+
+        this.settings.bindProperty(Settings.BindingDirection.IN,
                 "url", "url", this.url_changed, null);
         this.url_changed();
 
         this.settings.bindProperty(Settings.BindingDirection.IN,
-                "show_read_items", "show_read_items", this.build_menu, null);
-        this.settings.bindProperty(Settings.BindingDirection.IN,
-                "max_items", "max_items", this.build_menu, null);
-        this.settings.bindProperty(Settings.BindingDirection.IN,
-                "show_feed_image", "show_feed_image", this.build_menu, null);
-        this.build_menu();
+                "list_file", "list_file", this.feed_list_file_changed, null);
+        this.feed_list_file_changed();
     },
-
+    // called whenever a different feed source (file or list) is chosen
+    feed_source_changed: function() {
+        // just call both the file and list callback and let them figure
+        // out what to do
+        this.url_changed();
+        this.feed_list_file_changed();
+    },
     build_context_menu: function() {
         var s = new Applet.MenuItem(
                 _("Mark all read"),
@@ -311,6 +393,15 @@ FeedApplet.prototype = {
         s.icon.icon_type = St.IconType.SYMBOLIC;
         this._applet_context_menu.addMenuItem(s);
 
+        var s = new Applet.MenuItem(
+                _("Reload Feeds File"),
+                "view-refresh-symbolic",
+                Lang.bind(this, function() {
+                    this.feed_list_file_changed();
+                }));
+        s.icon.icon_type = St.IconType.SYMBOLIC;
+        this._applet_context_menu.addMenuItem(s);
+
         s = new Applet.MenuItem(
                 _("Settings"),
                 "emblem-system-symbolic",
@@ -321,91 +412,94 @@ FeedApplet.prototype = {
         this._applet_context_menu.addMenuItem(s);
     },
 
+    feed_list_file_changed: function() {
+        // if the file is not the source don't do anything
+        if (! this.use_list_file) return;
+        let filename = this.list_file;
+        let url_list = [];
+        try {
+            var content = Cinnamon.get_file_contents_utf8_sync(filename);
+            url_list = content.split("\n");
+        } catch (e) {
+            global.logError("error while parsing file " + e);
+            this.feed_file_error = true;
+        }
+        
+        // eliminate empty urls
+        // this has to be done because some text editors automatically
+        // add an empty line at the end of a file and empty URLS cause the
+        // reader to get hickups
+        for (var i in url_list) {
+            if (url_list[i].length == 0) {
+                url_list.splice(i--,1);
+                continue;
+            }
+        }
+        this.feeds_changed(url_list);
+    },
+
     url_changed: function() {
+        // if the list is not the source, don't do anything
+        if (this.use_list_file) return;
         let url_list = this.url.replace(/\s+/g, " ").replace(/\s*$/, '').replace(/^\s*/, '').split(" ");
-        this.reader = new Array();
+        this.feeds_changed(url_list);
+    },
+
+    // called when feeds have been added or removed
+    feeds_changed: function(url_list) {
+        this.feeds = new Array();
+
+        this.menu.removeAll();
 
         for (var i in url_list) {
-            this.reader[i] = new FeedReader.FeedReader(
-                    url_list[i],
-                    '~/.cinnamon/' + UUID + '/' + this.instance_id,
+            this.feeds[i] = new FeedDisplayMenuItem(url_list[i], this,
                     {
-                        'onUpdate' : Lang.bind(this, this.on_update),
-                        'onError' : Lang.bind(this, this.on_error)
+                        max_items: this.max_items,
+                        show_read_items: this.show_read_items,
+                        show_feed_image: this.show_feed_image
                     });
+            this.menu.addMenuItem(this.feeds[i]);
+
+            if (i == 0)
+                this.feeds[i].show = true;
+            else
+                this.feeds[i].show = false;
         }
-        this.build_menu();
         this.refresh();
     },
 
-    on_update: function() {
-        this.build_menu();
-    },
+    /* Called by Feed Display items to notify of changes to
+     * feed info (e.g. unread count, title).  Updates the
+     * applet icon and tooltip */
+    update: function() {
+        let unread_count = 0;
+        let tooltip = "";
 
-    on_error: function(reader, message, full_message) {
-        /* Just build the menu - this will interrogate the reader for errors */
-        this.build_menu();
-    },
-
-    build_menu: function() {
-
-        this.menu.removeAll();
-        this.feed_title_items = new Array();
-
-        let applet_has_unread = false;
-        let applet_tooltip = "";
-
-        for (var r = 0; r < this.reader.length; r++) {
-            if (this.reader[r] == undefined)
-                continue;
-
-            this.feed_title_items[r] = new FeedDisplayMenuItem(this.reader[r], this);
-            this.menu.addMenuItem(this.feed_title_items[r]);
-
-            let unread_count = 0;
-            let menu_items = 0;
-
-            /* Display error message for this reader and continue */
-            if (this.reader[r].error) {
-                let err_label = new LabelMenuItem(this.reader[r].error_messsage,
-                        this.reader[r].error_details);
-                this.menu.addMenuItem(err_label);
-                continue;
-            }
-
-            for (var i = 0; i < this.reader[r].items.length && menu_items < this.max_items; i++) {
-                if (!this.show_read_items && this.reader[r].items[i].read)
-                    continue;
-
-                if (!this.reader[r].items[i].read)
-                    unread_count++;
-
-                menu_items++;
-            }
-
-            if (0 == menu_items)
-                this.menu.addMenuItem(new LabelMenuItem(_("No new items"), ''));
-
-
-            /* Append to applet tooltip */
-            if (r != 0)
-                applet_tooltip += '\n';
-            if (unread_count > 0) {
-                applet_tooltip += this.reader[r].title + ' [' + unread_count + ']';
-                applet_has_unread = true;
-            } else {
-                applet_tooltip += this.reader[r].title;
-            }
+        for (var i = 0; i < this.feeds.length; i++) {
+            unread_count += this.feeds[i].get_unread_count();
+            if (i != 0)
+                tooltip += "\n";
+            tooltip += this.feeds[i].get_title() + "[" + this.feeds[i].get_unread_count() + "]";
         }
 
-        if (applet_has_unread)
+        if (unread_count > 0)
             this.set_applet_icon_symbolic_name("feed-new");
         else
             this.set_applet_icon_symbolic_name("feed");
 
-        this.set_applet_tooltip(applet_tooltip);
+        this.set_applet_tooltip(tooltip);
     },
 
+    update_params: function() {
+        for (var i = 0; i < this.feeds.length; i++) {
+            this.feeds[i].update_params({
+                    max_items: this.max_items,
+                    show_read_items: this.show_read_items,
+                    show_feed_image: this.show_feed_image
+            });
+            this.feeds[i].update();
+        }
+    },
 
     refresh: function() {
         /* Remove any previous timeout */
@@ -414,10 +508,9 @@ FeedApplet.prototype = {
             this.timer_id = 0;
         }
 
-        /* Get feed data */
-        for (var i = 0; i < this.reader.length; i++) {
-            if (this.reader[i] != undefined)
-                this.reader[i].get();
+        /* Update all feed display items */
+        for (var i = 0; i < this.feeds.length; i++) {
+            this.feeds[i].refresh();
         }
 
         /* Convert refresh interval from mins -> ms */
@@ -430,10 +523,23 @@ FeedApplet.prototype = {
 
     on_applet_clicked: function(event) {
         this.menu.toggle();
-        for (var i = 0; i < this.feed_title_items.length; i++) {
-            this.feed_title_items[i].menu.open()
+        this.toggle_submenus(null);
+    },
+
+    toggle_submenus: function(feed_to_show) {
+        for (i in this.feeds) {
+            if (feed_to_show != null && feed_to_show != this.feeds[i]) {
+                this.feeds[i].show = false;
+            }
+
+            if (this.feeds[i].show) {
+                this.feeds[i].menu.open(true);
+            }
+            if (!this.feeds[i].show) {
+                this.feeds[i].menu.close(true);
+            }
         }
-    }
+    },
 };
 
 function main(metadata, orientation, panel_height, instance_id) {
