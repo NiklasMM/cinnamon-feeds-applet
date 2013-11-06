@@ -53,6 +53,8 @@ LabelMenuItem.prototype = {
     _init: function (text, tooltip, params) {
         PopupMenu.PopupBaseMenuItem.prototype._init.call(this, params);
 
+        this.addActor(new St.Label());
+
         let label = new St.Label({ text: text });
         this.addActor(label);
 
@@ -67,22 +69,33 @@ function FeedMenuItem() {
 }
 
 FeedMenuItem.prototype = {
-    __proto__: Applet.MenuItem.prototype,
+    __proto__: PopupMenu.PopupBaseMenuItem.prototype,
 
     _init: function (item, params) {
+        PopupMenu.PopupBaseMenuItem.prototype._init.call(this);
+
         this.item = item;
         if (this.item.read)
-            this._icon = 'feed-symbolic';
+            this._icon_name = 'feed-symbolic';
         else
-            this._icon = 'feed-new-symbolic';
+            this._icon_name = 'feed-new-symbolic';
 
-        Applet.MenuItem.prototype._init.call(this,
-                FeedReader.html2text(item.title),
-                this._icon,
-                Lang.bind(this, function() {
+        let table = new St.Table({homogeneous: false, reactive: true });
+
+        this.icon = new St.Icon({icon_name: this._icon_name,
+                icon_type: St.IconType.SYMBOLIC,
+                style_class: 'popup-menu-icon' });
+        table.add(this.icon, {row: 0, col: 0, col_span: 1, x_expand: false, x_align: St.Align.START});
+
+        this.label = new St.Label({text: FeedReader.html2text(item.title)});
+        this.label.set_margin_left(6.0);
+        table.add(this.label, {row: 0, col: 1, col_span: 1, x_align: St.Align.START});
+
+        this.addActor(table, {expand: true, span: 1, align: St.Align.START});
+
+        this.connect('activate', Lang.bind(this, function() {
                     this.read_item();
                 }));
-        this.icon.icon_type = St.IconType.SYMBOLIC;
 
         let tooltip = new Tooltips.Tooltip(this.actor,
                 FeedReader.html2text(item.description));
@@ -109,8 +122,8 @@ FeedMenuItem.prototype = {
         /* Update icon */
         this.removeActor(this.label);
         this.removeActor(this.icon);
-        this._icon = 'feed-symbolic';
-        this.icon = new St.Icon({ icon_name: this._icon,
+        this._icon_name = 'feed-symbolic';
+        this.icon = new St.Icon({ icon_name: this._icon_name,
                 icon_type: St.IconType.SYMBOLIC,
                 style_class: 'popup-menu-icon' });
 
@@ -134,6 +147,7 @@ FeedDisplayMenuItem.prototype = {
         this.max_items = params.max_items;
         this.show_feed_image = params.show_feed_image;
         this.show_read_items = params.show_read_items;
+        this.unread_count = 0;
 
         /* Create reader */
         this.reader = new FeedReader.FeedReader(
@@ -152,20 +166,26 @@ FeedDisplayMenuItem.prototype = {
             vertical: true
         });
         this.mainbox.add(new St.Label({text:_("_Loading")}));
-        let container = new St.BoxLayout();
-        container.add(this.mainbox);
 
         this.statusbox = new St.BoxLayout({
-            style_class: 'feedreader-status'
+            style_class: 'feedreader-status',
+            vertical: true
         });
 
         /* Remove/re-add PopupSubMenuMenuItem actors to insert our own actors
-         * in place of the the regular label */
+         * in place of the the regular label. We use a table to increase
+         * control of the layout */
         this.removeActor(this.label);
         this.removeActor(this._triangle);
-        this.addActor(this.statusbox);
-        this.addActor(container);
-        this.addActor(this._triangle, {align: St.Align.START});
+        let table = new St.Table({homogeneous: false,
+                                    reactive: true });
+
+        table.add(this.statusbox,
+                {row: 0, col: 0, col_span: 1, x_expand: false, x_align: St.Align.START, y_align: St.Align.MIDDLE});
+        table.add(this.mainbox,
+                {row: 0, col: 1, col_span: 1, x_expand: true, x_align: St.Align.START});
+
+        this.addActor(table, {expand: true, align: St.Align.START});
 
         this.menu.connect('open-state-changed', Lang.bind(this, this.on_open_state_changed));
 
@@ -199,11 +219,7 @@ FeedDisplayMenuItem.prototype = {
     },
 
     get_unread_count: function() {
-        let count = 0;
-        for (i in this.reader.items)
-            count++;
-
-        return count;
+        return this.unread_count;
     },
 
     /* Rebuild the feed title, status, items from the feed reader */
@@ -234,6 +250,7 @@ FeedDisplayMenuItem.prototype = {
             }
         }
 
+        /* Add buttons */
         let buttonbox = new St.BoxLayout({
             style_class: 'feedreader-title-buttons'
         });
@@ -272,10 +289,15 @@ FeedDisplayMenuItem.prototype = {
 
         this.mainbox.add(buttonbox);
 
+        /* Add feed items to submenu */
         let menu_items = 0;
+        this.unread_count = 0;
         for (var i = 0; i < this.reader.items.length && menu_items < this.max_items; i++) {
             if (this.reader.items[i].read && !this.show_read_items)
                 continue;
+
+            if (!this.reader.items[i].read)
+                this.unread_count++;
 
             let item = new FeedMenuItem(this.reader.items[i]);
             item.connect("activate", function(actor, event) {
@@ -285,6 +307,22 @@ FeedDisplayMenuItem.prototype = {
 
             menu_items++;
         }
+
+        /* Update statusbox */
+        if (this.unread_count > 0)
+            var status_icon = 'feed-new-symbolic';
+        else
+            var status_icon = 'feed-symbolic';
+
+        let _icon = new St.Icon({ icon_name: status_icon,
+                icon_type: St.IconType.SYMBOLIC,
+                style_class: 'popup-menu-icon'});
+        this.statusbox.add(_icon, {
+                x_fill: false,
+                x_align: St.Align.MIDDLE,
+                y_fill: false,
+                y_align: St.Align.END,
+                expand: true});
 
         this.owner.update();
     },
@@ -298,7 +336,6 @@ FeedDisplayMenuItem.prototype = {
     },
 
     on_open_state_changed: function(menu, open) {
-        this.show = open;
         if (open)
             this.owner.toggle_submenus(this);
         else
@@ -459,12 +496,11 @@ FeedApplet.prototype = {
                         show_feed_image: this.show_feed_image
                     });
             this.menu.addMenuItem(this.feeds[i]);
-
-            if (i == 0)
-                this.feeds[i].show = true;
-            else
-                this.feeds[i].show = false;
         }
+
+        if (this.feeds.length > 0)
+            this.feed_to_show = this.feeds[0];
+
         this.refresh();
     },
 
@@ -527,15 +563,13 @@ FeedApplet.prototype = {
     },
 
     toggle_submenus: function(feed_to_show) {
-        for (i in this.feeds) {
-            if (feed_to_show != null && feed_to_show != this.feeds[i]) {
-                this.feeds[i].show = false;
-            }
+        if (feed_to_show != null)
+            this.feed_to_show = feed_to_show;
 
-            if (this.feeds[i].show) {
+        for (i in this.feeds) {
+            if (this.feed_to_show == this.feeds[i]) {
                 this.feeds[i].menu.open(true);
-            }
-            if (!this.feeds[i].show) {
+            } else {
                 this.feeds[i].menu.close(true);
             }
         }
